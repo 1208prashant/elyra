@@ -79,6 +79,8 @@ class FileOpBase(ABC):
         import minio
         from minio.credentials import providers
 
+        from elyra.util.cos import region_for_minio_client
+
         self.filepath = kwargs["filepath"]
         self.input_params = kwargs or []
         self.cos_endpoint = urlparse(self.input_params.get("cos-endpoint"))
@@ -103,8 +105,14 @@ class FileOpBase(ABC):
                 "Please validate your runtime configuration details and retry."
             )
 
-        # get minio client
-        self.cos_client = minio.Minio(self.cos_endpoint.netloc, secure=self.secure, credentials=cred_provider)
+        # Region must be set here. Otherwise each object call issues
+        # GetBucketLocation, which shared buckets often deny.
+        self.cos_client = minio.Minio(
+            self.cos_endpoint.netloc,
+            secure=self.secure,
+            credentials=cred_provider,
+            region=region_for_minio_client(self.cos_endpoint),
+        )
 
     @abstractmethod
     def execute(self) -> None:

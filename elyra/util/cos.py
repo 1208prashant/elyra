@@ -23,6 +23,37 @@ from minio.credentials import providers
 from minio.error import S3Error
 from traitlets.config import LoggingConfigurable
 
+# SigV4 default used by MinIO and most S3-compatible services. Passing this
+# region at client construction stops the MinIO client from calling
+# GetBucketLocation on later requests. AWS hosts are left unset so the client
+# can keep the region from the hostname.
+_DEFAULT_S3_COMPATIBLE_REGION = "us-east-1"
+_AWS_ENDPOINT_SUFFIXES = (".amazonaws.com", ".amazonaws.com.cn")
+
+
+def region_for_minio_client(endpoint, configured_region: Optional[str] = None) -> Optional[str]:
+    """
+    Region argument for minio.Minio.
+
+    MinIO issues GetBucketLocation whenever a client is built without a region
+    and credentials are present. That call, and the HeadBucket check behind
+    bucket_exists, requires permissions that shared buckets often do not grant.
+    A configured region is always honored. Otherwise a non-AWS endpoint uses
+    the S3-compatible default so object operations do not look the region up.
+    AWS endpoints stay unset unless a region was configured.
+    """
+    if isinstance(configured_region, str):
+        configured_region = configured_region.strip() or None
+    if configured_region:
+        return configured_region
+
+    host = ""
+    if endpoint is not None:
+        host = (getattr(endpoint, "hostname", None) or "").lower().rstrip(".")
+    if host in ("amazonaws.com", "amazonaws.com.cn") or host.endswith(_AWS_ENDPOINT_SUFFIXES):
+        return None
+    return _DEFAULT_S3_COMPATIBLE_REGION
+
 
 class CosClient(LoggingConfigurable):
     """
@@ -32,7 +63,9 @@ class CosClient(LoggingConfigurable):
 
     client = None
 
-    def __init__(self, config=None, endpoint=None, access_key=None, secret_key=None, bucket=None, **kwargs):
+    def __init__(
+        self, config=None, endpoint=None, access_key=None, secret_key=None, bucket=None, region=None, **kwargs
+    ):
         super().__init__(**kwargs)
 
         cred_provider = None
@@ -93,12 +126,34 @@ class CosClient(LoggingConfigurable):
         # Infer secure from the endpoint's scheme.
         self.secure = self.endpoint.scheme == "https"
 
-        # get minio client
-        self.client = minio.Minio(endpoint=self.endpoint.netloc, secure=self.secure, credentials=cred_provider)
+        if region is None and config is not None:
+            region = config.metadata.get("cos_region")
 
-        # Make a bucket with the make_bucket API call.
+        # Set the region up front. Without it, every MinIO request calls
+        # GetBucketLocation, which shared buckets commonly deny.
+        self.client = minio.Minio(
+            endpoint=self.endpoint.netloc,
+            secure=self.secure,
+            credentials=cred_provider,
+            region=region_for_minio_client(self.endpoint, region),
+        )
+
+        # Confirm the bucket when the API allows it. A denied list or location
+        # check is not proof that object operations will fail.
         try:
-            if not self.client.bucket_exists(bucket_name=self.bucket):
+            try:
+                bucket_exists = self.client.bucket_exists(bucket_name=self.bucket)
+            except S3Error as ex:
+                if ex.code != "AccessDenied":
+                    raise
+                self.log.warning(
+                    f"Skipping object storage bucket check for '{self.bucket}' because "
+                    "listing the bucket or reading its location was denied. "
+                    "Continuing with the configured object storage credentials."
+                )
+                bucket_exists = True
+
+            if not bucket_exists:
                 self.client.make_bucket(bucket_name=self.bucket)
         except S3Error as ex:
             # unpack the S3Error based off error codes
