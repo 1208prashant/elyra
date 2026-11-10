@@ -212,3 +212,9 @@ def test_kfp_bootstrapper_leaves_aws_region_unset(monkeypatch):
     from elyra.kfp.bootstrapper import FileOpBase
 
     _assert_bootstrapper_region(monkeypatch, FileOpBase, "https://s3.eu-west-1.amazonaws.com", None)
+
+
+def test_airflow_bootstrapper_supplies_region_for_later_calls(monkeypatch):
+    from elyra.airflow.bootstrapper import FileOpBase
+
+    _assert_bootstrapper_region(monkeypatch, FileOpBase, "https://s3.example.test", "us-east-1")
